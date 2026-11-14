@@ -4,27 +4,35 @@
 # five quantiles, from the minute prices in the case file only. No network,
 # no wall clock, deterministic.
 #
-# Model (tuned on the kit's six practice cases, NVIDIA event):
-#   - median = the market's last price (persistence; drift hurts on practice).
+# Model v2 (tuned on the kit's six practice cases, NVIDIA event).
+# Changes vs v1 (0.270461): alpha 0.40 -> 0.36, winsor clip 0.02 -> 0.04,
+# outer-quantile widening 1.15 -> 1.30, plus a small mean-reversion of the
+# median toward the market's median price over the last 960 minutes
+# (8% of the distance, ramped linearly over the 240-minute horizon).
+#   - median: last price, pulled 8% * (h/240) toward the 960-min median.
+#     Prediction-market prices mean-revert after shocks; the pull is tiny
+#     (bounded downside if the final regime trends instead) and won on all
+#     six practice cases. Markets with <60 prices get no pull (median = last).
 #   - spread: a winsorized standard deviation of the market's 1-minute
-#     returns over the last 120 minutes (clipping moves at +/-0.02 so one
+#     returns over the last 120 minutes (clipping moves at +/-0.04 so one
 #     jump cannot blow up the width), floored at 0.0005 and capped at 0.008
 #     price units per minute.
-#   - width grows as h**0.4, not sqrt(h): Polymarket prices are sticky and
-#     mean-reverting over 4 hours, so the move distribution saturates
-#     (alpha 0.4 beat 0.5 by ~0.005 and 0.6 by ~0.04 on practice).
-#   - the outer quantiles (0.05 / 0.95) are widened x1.15 relative to the
+#   - width grows as h**0.36, not sqrt(h): Polymarket prices are sticky and
+#     mean-reverting over 4 hours, so the move distribution saturates.
+#   - the outer quantiles (0.05 / 0.95) are widened x1.30 relative to the
 #     normal quantiles: jumps are rare but real, and the outer levels pay
 #     for them.
 #   - quantiles clamped to [0, 1], rounded to 6 decimals, monotone.
 #
 # Practice (local scorer, answers from the next case file + Polymarket
 # history for p05; scorer reproduces the house baseline's stated
-# 0.363589 exactly): this entry 0.270461 vs house baseline 0.363589
-# (-25.6%). The house model forecast is a one-shot superbot answer the
-# house replays with the same q = x + drift*h/60 + z*sigma*sqrt(h) form;
-# this entry's adaptive per-market sigma + sub-diffusive width is a
-# different, tighter family and beats the baseline by a wide margin.
+# 0.363589 exactly): this entry 0.263463 vs v1 0.270461 vs house baseline
+# 0.363589 (-27.5% vs house). Wins on all six practice cases
+# (p00 0.450, p01 0.305, p02 0.332, p03 0.238, p04 0.196, p05 0.120).
+# NOT adopted: a cross-market sum constraint scored 0.259516 on practice,
+# but it assumes mutually-exclusive markets; the FAA family is NOT mutually
+# exclusive (Iran is a subset of foreign actor), so it would not transfer
+# and could actively hurt. Deliberately left out.
 
 import json
 import math
@@ -39,16 +47,21 @@ OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 QUANTILES = (0.05, 0.25, 0.5, 0.75, 0.95)
 # The standard normal's quantile at each level, to 6 decimals.
 Z = (-1.644854, -0.67449, 0.0, 0.67449, 1.644854)
-# Outer quantiles are widened x1.15 (jump risk); inner levels stay normal.
-Z_MULT = (1.15, 1.0, 1.0, 1.0, 1.15)
+# Outer quantiles are widened x1.30 in v2 (jump risk); inner levels stay normal.
+Z_MULT = (1.30, 1.0, 1.0, 1.0, 1.30)
 
 # Winsorized-sigma parameters (see the module docstring).
 LOOKBACK_MIN = 120
-CLIP_MOVE = 0.02
+CLIP_MOVE = 0.04
 SIGMA_FLOOR = 0.0005
 SIGMA_CAP = 0.008
 # Width grows as h ** ALPHA.
-ALPHA = 0.4
+ALPHA = 0.36
+# Median mean-reversion: pull toward the median price over the last
+# MEDIAN_WINDOW minutes, SHRINK of the distance, ramped linearly over
+# the horizon (full pull only at h = 240).
+MEDIAN_WINDOW = 960
+SHRINK = 0.08
 
 
 def _norm_ppf(p):
@@ -121,6 +134,10 @@ def forecast_market(prices, horizon, quantiles):
         raise ValueError("market has no prices")
     x = prices[-1]
     sig = _sigma(prices)
+    if len(prices) > 60:
+        med_anchor = statistics.median(prices[-MEDIAN_WINDOW:])
+    else:
+        med_anchor = x
     if tuple(quantiles) == QUANTILES:
         zs = [z * m for z, m in zip(Z, Z_MULT)]
     else:
@@ -131,7 +148,8 @@ def forecast_market(prices, horizon, quantiles):
     rows = []
     for h in range(1, horizon + 1):
         w = sig * (h ** ALPHA)
-        row = [_price6(x + z * w) for z in zs]
+        med = x + (med_anchor - x) * SHRINK * (h / float(horizon))
+        row = [_price6(med + z * w) for z in zs]
         for j in range(1, len(row)):
             if row[j] < row[j - 1]:
                 row[j] = row[j - 1]
